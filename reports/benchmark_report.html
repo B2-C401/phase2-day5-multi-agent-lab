@@ -1,226 +1,4 @@
-"""Benchmark report rendering — markdown and HTML."""
-
-from __future__ import annotations
-
-import html as _html
-import json
-from datetime import datetime
-from typing import TYPE_CHECKING
-
-from multi_agent_research_lab.core.schemas import BenchmarkMetrics
-
-if TYPE_CHECKING:
-    from multi_agent_research_lab.core.state import ResearchState
-
-
-# ──────────────────────────────────────────────
-# Markdown
-# ──────────────────────────────────────────────
-
-
-def render_markdown_report(metrics: list[BenchmarkMetrics]) -> str:
-    lines: list[str] = [
-        "# Benchmark Report",
-        "",
-        "| Run | Latency (s) | Cost (USD) | Quality /10 | Notes |",
-        "|---|---:|---:|---:|---|",
-    ]
-    for item in metrics:
-        cost = "—" if item.estimated_cost_usd is None else f"{item.estimated_cost_usd:.4f}"
-        quality = "—" if item.quality_score is None else f"{item.quality_score:.1f}"
-        lines.append(
-            f"| {item.run_name} | {item.latency_seconds:.2f} | {cost} | {quality} | {item.notes} |"
-        )
-
-    if len(metrics) == 2:
-        lines += _comparison_section(metrics[0], metrics[1])
-
-    lines += [
-        "",
-        "## Notes",
-        "",
-        "- Quality scores are heuristic unless replaced by peer review.",
-        "- Cost uses gpt-4o-mini pricing ($0.15/1M input, $0.60/1M output).",
-        "",
-        "## Exit Ticket",
-        "",
-        "1. **When to use multi-agent?** — Complex tasks needing specialisation: search + analysis + writing.",
-        "2. **When NOT to use multi-agent?** — Simple Q&A where LLM overhead exceeds quality gain.",
-    ]
-    return "\n".join(lines) + "\n"
-
-
-def _comparison_section(a: BenchmarkMetrics, b: BenchmarkMetrics) -> list[str]:
-    ld = b.latency_seconds - a.latency_seconds
-    lines = [
-        "",
-        "## Comparison",
-        "",
-        f"| Metric | {a.run_name} | {b.run_name} | Delta |",
-        "|---|---:|---:|---:|",
-        f"| Latency (s) | {a.latency_seconds:.2f} | {b.latency_seconds:.2f} | {ld:+.2f} |",
-    ]
-    if a.estimated_cost_usd is not None and b.estimated_cost_usd is not None:
-        cd = b.estimated_cost_usd - a.estimated_cost_usd
-        lines.append(
-            f"| Cost (USD) | {a.estimated_cost_usd:.4f} | {b.estimated_cost_usd:.4f} | {cd:+.4f} |"
-        )
-    if a.quality_score is not None and b.quality_score is not None:
-        qd = b.quality_score - a.quality_score
-        lines.append(
-            f"| Quality /10 | {a.quality_score:.1f} | {b.quality_score:.1f} | {qd:+.1f} |"
-        )
-    return lines
-
-
-# ──────────────────────────────────────────────
-# HTML
-# ──────────────────────────────────────────────
-
-
-def generate_html_report(
-    metrics: list[BenchmarkMetrics],
-    baseline_state: ResearchState,
-    multi_state: ResearchState,
-    query: str,
-) -> str:
-    """Return a self-contained HTML benchmark report."""
-
-    assert len(metrics) == 2
-    bm, mm = metrics[0], metrics[1]
-
-    def _ev(state: ResearchState, name: str) -> dict:
-        for e in state.trace:
-            if e["name"] == name:
-                return e.get("payload", {})
-        return {}
-
-    researcher = _ev(multi_state, "researcher_done")
-    analyst = _ev(multi_state, "analyst_done")
-    writer = _ev(multi_state, "writer_done")
-
-    chart_data = json.dumps(
-        {
-            "labels": [bm.run_name, mm.run_name],
-            "latency": [round(bm.latency_seconds, 2), round(mm.latency_seconds, 2)],
-            "cost": [
-                round((bm.estimated_cost_usd or 0) * 10000, 2),
-                round((mm.estimated_cost_usd or 0) * 10000, 2),
-            ],
-            "quality": [bm.quality_score or 0, mm.quality_score or 0],
-        }
-    )
-
-    token_data = json.dumps(
-        {
-            "agents": ["Researcher", "Analyst", "Writer"],
-            "input": [
-                researcher.get("input_tokens", 0),
-                analyst.get("input_tokens", 0),
-                writer.get("input_tokens", 0),
-            ],
-            "output": [
-                researcher.get("output_tokens", 0),
-                analyst.get("output_tokens", 0),
-                writer.get("output_tokens", 0),
-            ],
-        }
-    )
-
-    def _md_to_html(text: str) -> str:
-        """Minimal markdown → HTML (headings, bold, line breaks)."""
-        import re
-
-        lines = _html.escape(text).split("\n")
-        out: list[str] = []
-        for line in lines:
-            if line.startswith("## "):
-                out.append(f"<h3>{line[3:]}</h3>")
-            elif line.startswith("### "):
-                out.append(f"<h4>{line[4:]}</h4>")
-            elif line.startswith("- ") or line.startswith("* "):
-                out.append(f"<li>{line[2:]}</li>")
-            elif line.strip() == "":
-                out.append("<br>")
-            else:
-                line = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
-                out.append(f"<p>{line}</p>")
-        return "\n".join(out)
-
-    baseline_html = _md_to_html(baseline_state.final_answer or "No answer produced.")
-    multi_html = _md_to_html(multi_state.final_answer or "No answer produced.")
-
-    route_str = " → ".join(multi_state.route_history) if multi_state.route_history else "—"
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    r_cost = f"${researcher.get('cost_usd', 0) or 0:.5f}"
-    a_cost = f"${analyst.get('cost_usd', 0) or 0:.5f}"
-    w_cost = f"${writer.get('cost_usd', 0) or 0:.5f}"
-    r_tok = f"{researcher.get('input_tokens',0)}+{researcher.get('output_tokens',0)}"
-    a_tok = f"{analyst.get('input_tokens',0)}+{analyst.get('output_tokens',0)}"
-    w_tok = f"{writer.get('input_tokens',0)}+{writer.get('output_tokens',0)}"
-    r_len = researcher.get("notes_length", 0)
-    a_len = analyst.get("analysis_length", 0)
-    w_len = writer.get("answer_length", 0)
-
-    latency_delta = mm.latency_seconds - bm.latency_seconds
-    cost_delta = (mm.estimated_cost_usd or 0) - (bm.estimated_cost_usd or 0)
-    quality_delta = (mm.quality_score or 0) - (bm.quality_score or 0)
-
-    return _HTML_TEMPLATE.replace("%%CHART_DATA%%", chart_data).replace(
-        "%%TOKEN_DATA%%", token_data
-    ).replace("%%QUERY%%", _html.escape(query)).replace("%%NOW%%", now).replace(
-        "%%ROUTE%%", route_str
-    ).replace(
-        "%%BM_LATENCY%%", f"{bm.latency_seconds:.2f}"
-    ).replace(
-        "%%MM_LATENCY%%", f"{mm.latency_seconds:.2f}"
-    ).replace(
-        "%%BM_COST%%", f"${bm.estimated_cost_usd or 0:.4f}"
-    ).replace(
-        "%%MM_COST%%", f"${mm.estimated_cost_usd or 0:.4f}"
-    ).replace(
-        "%%BM_QUALITY%%", f"{bm.quality_score or 0:.1f}"
-    ).replace(
-        "%%MM_QUALITY%%", f"{mm.quality_score or 0:.1f}"
-    ).replace(
-        "%%LATENCY_DELTA%%", f"+{latency_delta:.2f}s"
-    ).replace(
-        "%%COST_DELTA%%", f"+${cost_delta:.4f}"
-    ).replace(
-        "%%QUALITY_DELTA%%", f"+{quality_delta:.1f}"
-    ).replace(
-        "%%R_TOK%%", r_tok
-    ).replace(
-        "%%A_TOK%%", a_tok
-    ).replace(
-        "%%W_TOK%%", w_tok
-    ).replace(
-        "%%R_COST%%", r_cost
-    ).replace(
-        "%%A_COST%%", a_cost
-    ).replace(
-        "%%W_COST%%", w_cost
-    ).replace(
-        "%%R_LEN%%", str(r_len)
-    ).replace(
-        "%%A_LEN%%", str(a_len)
-    ).replace(
-        "%%W_LEN%%", str(w_len)
-    ).replace(
-        "%%BASELINE_HTML%%", baseline_html
-    ).replace(
-        "%%MULTI_HTML%%", multi_html
-    ).replace(
-        "%%ITERATIONS%%", str(multi_state.iteration)
-    )
-
-
-# ──────────────────────────────────────────────
-# HTML Template
-# ──────────────────────────────────────────────
-
-_HTML_TEMPLATE = """<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -324,8 +102,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Header -->
   <header>
     <h1>&#128300; Multi-Agent Research Lab</h1>
-    <p class="meta">Generated %%NOW%% &nbsp;|&nbsp; Model: gpt-4o-mini &nbsp;|&nbsp; %%ITERATIONS%% iterations</p>
-    <div class="query-box">&#128269; %%QUERY%%</div>
+    <p class="meta">Generated 2026-05-06 12:18 &nbsp;|&nbsp; Model: gpt-4o-mini &nbsp;|&nbsp; 4 iterations</p>
+    <div class="query-box">&#128269; Research GraphRAG state-of-the-art and write a 500-word summary</div>
   </header>
 
   <!-- Architecture -->
@@ -372,20 +150,20 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <tbody>
       <tr>
         <td><span class="tag-single">single-agent</span></td>
-        <td>%%BM_LATENCY%%</td>
-        <td>%%BM_COST%%</td>
-        <td>%%BM_QUALITY%%</td>
+        <td>12.09</td>
+        <td>$0.0004</td>
+        <td>6.0</td>
         <td>—</td>
       </tr>
       <tr>
         <td><span class="tag-multi">multi-agent</span></td>
-        <td>%%MM_LATENCY%%</td>
-        <td>%%MM_COST%%</td>
-        <td>%%MM_QUALITY%%</td>
+        <td>24.87</td>
+        <td>$0.0013</td>
+        <td>8.9</td>
         <td>
-          <span class="delta-neg">%%LATENCY_DELTA%%</span> latency &nbsp;
-          <span class="delta-neg">%%COST_DELTA%%</span> cost &nbsp;
-          <span class="delta-pos">%%QUALITY_DELTA%%</span> quality
+          <span class="delta-neg">+12.78s</span> latency &nbsp;
+          <span class="delta-neg">+$0.0009</span> cost &nbsp;
+          <span class="delta-pos">+2.9</span> quality
         </td>
       </tr>
     </tbody>
@@ -393,7 +171,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- Multi-Agent Trace -->
   <h2>&#128279; Multi-Agent Trace</h2>
-  <p style="color:var(--muted);margin-bottom:.75rem;font-size:.85rem;">Route: %%ROUTE%%</p>
+  <p style="color:var(--muted);margin-bottom:.75rem;font-size:.85rem;">Route: researcher → analyst → writer → done</p>
   <div class="trace-pipeline">
     <div class="trace-step">
       <div class="trace-node s">&#127959; Supervisor<br><small>iter=0</small></div>
@@ -401,7 +179,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <span class="trace-arrow">&#8594;</span>
     <div class="trace-step">
       <div class="trace-node r">&#128269; Researcher</div>
-      <div class="trace-meta">%%R_TOK%% tok<br>%%R_COST%%<br>%%R_LEN%% chars</div>
+      <div class="trace-meta">504+575 tok<br>$0.00042<br>3544 chars</div>
     </div>
     <span class="trace-arrow">&#8594;</span>
     <div class="trace-step">
@@ -410,7 +188,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <span class="trace-arrow">&#8594;</span>
     <div class="trace-step">
       <div class="trace-node a">&#128202; Analyst</div>
-      <div class="trace-meta">%%A_TOK%% tok<br>%%A_COST%%<br>%%A_LEN%% chars</div>
+      <div class="trace-meta">690+339 tok<br>$0.00031<br>2050 chars</div>
     </div>
     <span class="trace-arrow">&#8594;</span>
     <div class="trace-step">
@@ -419,7 +197,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <span class="trace-arrow">&#8594;</span>
     <div class="trace-step">
       <div class="trace-node w">&#9997; Writer</div>
-      <div class="trace-meta">%%W_TOK%% tok<br>%%W_COST%%<br>%%W_LEN%% chars</div>
+      <div class="trace-meta">1234+614 tok<br>$0.00055<br>3832 chars</div>
     </div>
     <span class="trace-arrow">&#8594;</span>
     <div class="trace-step">
@@ -439,16 +217,82 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="output-card">
       <div class="output-header single">
         &#128100; Single-Agent Baseline
-        <span class="badge badge-yellow">Quality: %%BM_QUALITY%%/10</span>
+        <span class="badge badge-yellow">Quality: 6.0/10</span>
       </div>
-      <div class="output-body">%%BASELINE_HTML%%</div>
+      <div class="output-body"><p>GraphRAG, short for Graph Retrieval-Augmented Generation, is a significant advancement in the intersection of natural language processing (NLP) and graph-based knowledge retrieval. This approach leverages the structured nature of knowledge graphs to enhance the capabilities of generative language models, enabling them to produce contextually relevant and factually accurate content based on external data. The concept of retrieval-augmented generation has gained traction, as it combines generative models’ fluency with retrieval models&#x27; factual grounding.</p>
+<br>
+<p><strong>Key Concepts and Mechanism</strong></p>
+<br>
+<p>The GraphRAG framework operates by integrating knowledge graphs—data representations where entities (nodes) are connected by relationships (edges). This structure allows for a more organized and meaningful representation of information compared to unstructured text. The typical sequence of operations in GraphRAG involves:</p>
+<br>
+<p>1. <strong>Query Encoding:</strong> The user provides a natural language query, which is transformed into a graph-compatible format.</p>
+<p>2. <strong>Graph Retrieval:</strong> The system retrieves relevant information from a knowledge graph using the encoded query. This can involve utilizing techniques such as graph traversal or embedding methods which leverage the relationships inherent in the graph.</p>
+<p>3. <strong>Content Generation:</strong> The retrieved data is then fed into a generative language model, which crafts responses that incorporate the factual information while maintaining natural linguistic fluency.</p>
+<br>
+<p>The architecture significantly differs from traditional retrieval-augmented generation models, which generally rely on document retrieval, working instead within a more organized framework that harnesses the connectivity and semantic relationships present in graphs.</p>
+<br>
+<p><strong>Advantages and Tradeoffs</strong></p>
+<br>
+<p>GraphRAG showcases several advantages over conventional approaches. Firstly, the use of a knowledge graph can significantly improve the accuracy of the information presented. Since entities are interconnected, the model can access not just isolated facts but also related information, providing a more comprehensive view of a topic. This networked access helps maintain context, enhancing the logical flow and coherence of generated responses.</p>
+<br>
+<p>Additionally, the ability to constantly update knowledge graphs with new data facilitates real-time adjustments, ensuring that the generative responses are current and relevant.</p>
+<br>
+<p>However, there are tradeoffs inherent in this model. The construction and maintenance of knowledge graphs can be resource-intensive, requiring continual updates and expert curation to retain accuracy. Further, the complexity involved in designing efficient graph retrieval algorithms can pose challenges in terms of computational resources; the processing power needed to traverse large-scale graphs or execute graph-based embeddings may be significant.</p>
+<br>
+<p>Moreover, the effectiveness of the performance heavily relies on the quality of the underlying knowledge graph. A poorly structured or incomplete graph may yield inadequate or misleading responses, limiting the potential benefits of the system overall. </p>
+<br>
+<p><strong>Applications and Future Directions</strong></p>
+<br>
+<p>GraphRAG holds promise for a variety of applications, including but not limited to customer support, academic research, content creation, and more. By leveraging the deep connections within a knowledge graph, industries can significantly enhance information retrieval processes, thus enabling more sophisticated interactions with users.</p>
+<br>
+<p>Going forward, advancements in multi-modal graph processing, combining textual, visual, and auditory data into unified graphs, may lead to further enhancements in retrieval accuracy and generative capabilities in the GraphRAG model.</p>
+<br>
+<p><strong>Key Takeaways:</strong></p>
+<br>
+<li>GraphRAG integrates knowledge graphs with generative language models to improve factual accuracy and contextual relevance.</li>
+<li>The model retrieves interconnected information, providing a broader context rather than isolated facts.</li>
+<li>Tradeoffs exist in terms of resource intensity and dependency on the quality of the underlying knowledge graph.</li>
+<li>Potential applications span various industries, suggesting a significant leap in conversational interfaces, content generation, and knowledge extraction.</li></div>
     </div>
     <div class="output-card">
       <div class="output-header multi">
         &#129302; Multi-Agent (Supervisor+3)
-        <span class="badge badge-green">Quality: %%MM_QUALITY%%/10</span>
+        <span class="badge badge-green">Quality: 8.9/10</span>
       </div>
-      <div class="output-body">%%MULTI_HTML%%</div>
+      <div class="output-body"><h3>Understanding GraphRAG: State-of-the-Art Overview</h3>
+<br>
+<p>GraphRAG (Graph-based Retrieval-Augmented Generation) represents a significant innovation in the realms of natural language processing and data retrieval, showcasing enhanced accuracy, efficiency, and scalability. Recent advancements indicate that systems utilizing these methodologies have improved performance through the integration of modern techniques, allowing for higher-quality outputs from complex data structures [1]. This summary encapsulates the key findings, challenges, and future directions within the GraphRAG landscape.</p>
+<br>
+<h3>Key Findings and Performance Metrics</h3>
+<br>
+<li>**Enhanced Accuracy and Efficiency**: Recent implementations of specialized components in GraphRAG systems have reported improvements of up to 40% in performance when compared to traditional, monolithic architectures. Benchmarking studies substantiate these claims by evaluating latency, cost, and overall system quality [3].</li>
+<li>**Addressing Reliability Protocols**: Operational challenges such as context window overflow and cascading retries can lead to unpredictable outputs. Engineering teams are developing strategies like circuit breakers, output validation techniques, and incremental rollouts to mitigate these issues and enhance operational reliability [4].</li>
+<li>**Production Deployment Best Practices**: A guide on deployment emphasizes the importance of modular design, which allows flexibility and reduces operational overhead while improving reliability. Awareness of common pitfalls during deployment is crucial for ensuring optimal system performance [2].</li>
+<br>
+<h3>Future Directions and Challenges</h3>
+<br>
+<p>As the GraphRAG field evolves, critical challenges remain, particularly around:</p>
+<br>
+<li>**Factual Grounding**: There is a pressing need to enhance the accuracy of generated content to address misinformation and alleviate issues related to &quot;hallucinations&quot; — instances where models produce plausible but incorrect information. </li>
+<li>**Nuanced Multi-step Reasoning**: Ongoing research aims to enable models to perform complex reasoning, which will broaden their applicability in more intricate decision-making environments [5].</li>
+<br>
+<p>However, while there is consistency in identifying these challenges, there is less agreement on specific methodologies to implement improvements.</p>
+<br>
+<h3>Conflicting Information and Gaps</h3>
+<br>
+<p>While there is a consensus on the advantages offered by specialized components and deployment strategies, specific methodologies for implementation remain contentious among researchers. Moreover, while the necessity for improving factual accuracy is widely recognized, current literature lacks comprehensive frameworks or algorithms that address these challenges effectively. This emphasizes a notable research gap and indicates areas where further investigation is crucial for significant advancements.</p>
+<br>
+<h3>Conclusion</h3>
+<br>
+<p>In summary, the GraphRAG landscape is characterized by promising performance improvements attributed to modern methodologies, while also facing challenges in deploying solutions that prioritize factual accuracy and reasoning capabilities. Continuous innovation and research in these domains are expected to yield further advancements, making GraphRAG systems increasingly effective and versatile over the coming years.</p>
+<br>
+<h3>Key Takeaways</h3>
+<br>
+<li>Implementation of specialized components can improve performance by up to 40% compared to traditional systems.</li>
+<li>Common operational challenges can be mitigated through strategies like circuit breakers and validation techniques.</li>
+<li>Modular design in deployment enhances reliability and reduces operational overhead.</li>
+<li>There is a pressing need to improve factual grounding to combat misinformation effectively.</li>
+<li>Ongoing research focused on multi-step reasoning could significantly expand the applicability of GraphRAG technologies.</li></div>
     </div>
   </div>
 
@@ -520,8 +364,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <script>
-const D = %%CHART_DATA%%;
-const T = %%TOKEN_DATA%%;
+const D = {"labels": ["single-agent", "multi-agent"], "latency": [12.09, 24.87], "cost": [4.3, 12.81], "quality": [6.0, 8.87]};
+const T = {"agents": ["Researcher", "Analyst", "Writer"], "input": [504, 690, 1234], "output": [575, 339, 614]};
 
 const chartDefaults = {
   responsive: true,
@@ -570,4 +414,4 @@ new Chart(document.getElementById("tokenChart"), {
 });
 </script>
 </body>
-</html>"""
+</html>
